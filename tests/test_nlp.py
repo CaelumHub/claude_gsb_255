@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nlp import (get_segmenter, get_tagger, get_parser, get_constituency_parser,
                  get_ner, get_sentiment, get_summarizer, get_translator,
-                 get_keywords, get_embeddings, TAGSET)
+                 get_keywords, get_embeddings, get_multi_summarizer, TAGSET)
 from nlp.hmm import HMM
 from pipeline import PipelineEngine, PipelineError
 from storage import ShardedStore, StoreRegistry
@@ -109,6 +109,136 @@ class TestSummarizer(unittest.TestCase):
         r = get_summarizer().summarize(text, ratio=0.5)
         self.assertTrue(len(r["summary"]) < len(text))
         self.assertTrue(r["top_indices"])
+
+
+class TestMultiSummarizer(unittest.TestCase):
+    def setUp(self):
+        self.ms = get_multi_summarizer()
+        self.docs = [
+            {"doc_id": "a", "title": "甲报",
+             "text": "2024年5月1日，星河科技在北京发布AI芯片昇云900。该芯片算力达每秒1000万亿次，售价3万元。公司表示将于6月量产。"},
+            {"doc_id": "b", "title": "乙报",
+             "text": "星河科技5月1日推出昇云900芯片，算力为每秒1000万亿次。业内认为该产品将加剧行业竞争。"},
+            {"doc_id": "c", "title": "丙报",
+             "text": "这款芯片5月1日亮相，售价定为2.8万元。分析称供应不足，量产可能推迟至8月。星河科技总部位于深圳。"},
+        ]
+
+    def test_dedup_and_coverage(self):
+        r = self.ms.synthesize(self.docs, ratio=0.9)
+        # 两篇都写的「算力1000万亿次」应聚为一个事实簇
+        joined = " ".join(c["rep_text"] for c in r["clusters"])
+        self.assertIn("1000万亿次", joined)
+        chip_clusters = [c for c in r["clusters"] if "1000万亿次" in c["rep_text"]]
+        self.assertEqual(len(chip_clusters), 1)
+        self.assertGreaterEqual(chip_clusters[0]["support"], 2)
+        # 独有事实（深圳总部）不应丢
+        self.assertTrue(any("深圳" in c["rep_text"] for c in r["clusters"]))
+        # 摘要句子全部带出处引用
+        self.assertTrue(r["summary"].strip())
+        for s in r["sentences"]:
+            self.assertTrue(s["citations"])
+            self.assertTrue(all(x["text"] for x in s["sources"]))
+
+    def test_provenance_and_no_copy(self):
+        r = self.ms.synthesize(self.docs, ratio=0.9)
+        for s in r["sentences"]:
+            # 每个入选句必须能定位到具体文档与句序号
+            primary = [x for x in s["sources"] if x["is_primary"]]
+            self.assertEqual(len(primary), 1)
+            self.assertIn(primary[0]["doc_id"], ("a", "b", "c"))
+        # 单一来源占比不超过 60%（不整段照搬某一篇）
+        n = max(len(r["sentences"]), 1)
+        for count in r["stats"]["per_source"].values():
+            self.assertLessEqual(count / n, 0.7)
+
+    def test_conflict_not_merged(self):
+        r = self.ms.synthesize(self.docs, ratio=0.9)
+        # 3万 vs 2.8万 是数字口径冲突，必须上报并可追溯到两篇原句
+        num_conflicts = [c for c in r["conflicts"] if c["kind"] == "number"]
+        self.assertTrue(num_conflicts)
+        cf = num_conflicts[0]
+        self.assertIn("3万元", cf["claim_a"]["text"] + cf["claim_b"]["text"])
+        self.assertIn("2.8万元", cf["claim_a"]["text"] + cf["claim_b"]["text"])
+        self.assertNotEqual(cf["claim_a"]["doc_id"], cf["claim_b"]["doc_id"])
+        # 含 3万元 的句子与含 2.8万元 的句子不在同一事实簇
+        cluster_of = lambda frag: [c for c in r["clusters"]
+                                   if any(frag in m["text"] for m in c["members"])]
+        ids_3w = {c["id"] for c in cluster_of("3万元")}
+        ids_28w = {c["id"] for c in cluster_of("2.8万元")}
+        self.assertTrue(ids_3w and ids_28w and not (ids_3w & ids_28w))
+        # 甲报那句顺带提及、未被乙报印证的售价，应标为簇内独有口径
+        chip = next(c for c in r["clusters"]
+                    if any("3万元" in m["text"] for m in c["members"]))
+        self.assertIn("3万元", chip["unique_numbers"])
+
+        # 真正的日期冲突（5月3日 vs 5月4日）也不合并
+        r2 = self.ms.synthesize([
+            {"doc_id": "x", "title": "X", "text": "警方5月3日通报了这起事故，3人受伤。"},
+            {"doc_id": "y", "title": "Y", "text": "警方5月4日通报了这起事故，3人受伤。"},
+        ], ratio=0.9)
+        self.assertEqual(r2["stats"]["facts"], 2)
+        self.assertTrue(any(c["kind"] == "date" for c in r2["conflicts"]))
+
+        # 同一事实的重复表述（日期数字都一致）应当合并
+        r3 = self.ms.synthesize([
+            {"doc_id": "x", "title": "X", "text": "展会将于9月10日在上海开幕，预计10万人参观。"},
+            {"doc_id": "y", "title": "Y", "text": "本届展会9月10日在上海开幕，参观人数预计10万人。"},
+        ], ratio=0.9)
+        self.assertEqual(r3["stats"]["facts"], 1)
+        self.assertEqual(r3["conflicts"], [])
+
+    def test_timeline_order(self):
+        r = self.ms.synthesize(self.docs, ratio=0.7, order="timeline")
+        dated = [s for s in r["sentences"] if s["date"]]
+        keys = [s["date"] for s in dated]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_incremental_delete_keeps_shared_facts(self):
+        first = self.ms.synthesize(self.docs, ratio=0.9)
+        first_ids = {c["id"] for c in first["clusters"]}
+        # 删掉甲报
+        second = self.ms.update(first, self.docs[1:])
+        second_ids = {c["id"] for c in second["clusters"]}
+        # 共享事实（甲乙共述的算力发布会）通过 ID 继承仍然保留
+        chip = next(c for c in first["clusters"]
+                    if "1000万亿" in c["rep_text"])
+        self.assertIn(chip["id"], second_ids)
+        surviving = next(c for c in second["clusters"] if c["id"] == chip["id"])
+        self.assertEqual(surviving["source_doc_ids"], ["b"])
+        # 引用由 [甲][乙] 收敛为 [乙]，代表句换岗，摘要不塌
+        chip_sent = next(s for s in second["sentences"]
+                         if s["cluster_id"] == chip["id"])
+        self.assertEqual(chip_sent["citations"], [1])
+        # 甲报独有的 6 月量产事实随之消失，并在差异中标出
+        removed_texts = " ".join(c["text"] for c in second["changes"]["removed"])
+        self.assertIn("量产", removed_texts)
+        # 来源变化被记录：多源印证 2 -> 1
+        attr = next(a for a in second["changes"]["attribution"]
+                    if a["cluster_id"] == chip["id"])
+        self.assertEqual((attr["support_before"], attr["support_after"]), (2, 1))
+        self.assertEqual(attr["removed_sources"], ["a"])
+
+    def test_incremental_add(self):
+        first = self.ms.synthesize(self.docs[:2], ratio=0.9)
+        second = self.ms.update(first, self.docs)
+        self.assertTrue(second["changes"]["added"])
+        self.assertTrue(any("深圳" in c["text"] for c in second["changes"]["added"]))
+
+    def test_incremental_idempotent(self):
+        first = self.ms.synthesize(self.docs, ratio=0.9)
+        second = self.ms.update(first, self.docs)
+        self.assertEqual(second["changes"]["added"], [])
+        self.assertEqual(second["changes"]["removed"], [])
+        self.assertEqual(second["changes"]["attribution"], [])
+        # ID 保持稳定
+        self.assertEqual({c["id"] for c in first["clusters"]},
+                         {c["id"] for c in second["clusters"]})
+
+    def test_empty_and_single(self):
+        self.assertEqual(self.ms.synthesize([])["summary"], "")
+        r = self.ms.synthesize([{"doc_id": "a", "title": "A",
+                                 "text": "仅有一个事实的报道。"}])
+        self.assertIn("[1]", r["summary"])
 
 
 class TestTranslator(unittest.TestCase):

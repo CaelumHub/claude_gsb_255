@@ -13,6 +13,7 @@ from .parser import DependencyParser, ConstituencyParser, DEP_REL_NAMES, PHRASE_
 from .ner import NERExtractor, ENTITY_TYPE_NAMES
 from .sentiment import SentimentAnalyzer, POLARITY_NAMES
 from .summarizer import Summarizer
+from .multi_summary import MultiDocumentSummarizer
 from .translator import Translator
 from .keywords import KeywordExtractor
 from .embeddings import WordEmbeddings
@@ -21,11 +22,12 @@ from . import lexicon, text, hmm
 __all__ = [
     "Segmenter", "POSTagger", "DependencyParser", "ConstituencyParser",
     "NERExtractor", "SentimentAnalyzer", "Summarizer", "Translator",
-    "KeywordExtractor", "WordEmbeddings",
+    "KeywordExtractor", "WordEmbeddings", "MultiDocumentSummarizer",
     "TAG_NAMES", "TAGSET", "DEP_REL_NAMES", "PHRASE_NAMES", "ENTITY_TYPE_NAMES",
     "POLARITY_NAMES", "lexicon", "text", "hmm",
     "get_segmenter", "get_tagger", "get_parser", "get_ner", "get_sentiment",
-    "get_summarizer", "get_translator", "get_keywords", "get_embeddings",
+    "get_summarizer", "get_multi_summarizer", "get_translator",
+    "get_keywords", "get_embeddings",
 ]
 
 
@@ -66,6 +68,10 @@ def get_sentiment() -> SentimentAnalyzer:
 
 def get_summarizer() -> Summarizer:
     return _singleton("summarizer", Summarizer)
+
+
+def get_multi_summarizer() -> MultiDocumentSummarizer:
+    return _singleton("multi_summarizer", MultiDocumentSummarizer)
 
 
 def get_translator() -> Translator:

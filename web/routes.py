@@ -16,7 +16,8 @@ from flask import Blueprint, current_app, jsonify, request
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
+                 get_multi_summarizer, get_tagger, get_translator,
+                 ENTITY_TYPE_NAMES, TAG_NAMES,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
@@ -321,6 +322,155 @@ def summary():
         max_sentences=data.get("max_sentences"))
     rid = _store_result("summary", text, result, corpus_id=cid)
     result["id"] = rid
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# 多文档事实对齐与合成摘要
+# ---------------------------------------------------------------------------
+
+def _resolve_multi_documents(data: dict) -> list[dict]:
+    """把请求中的 documents（内联或 corpus_ids 引用）统一为算法入参。"""
+    documents: list[dict] = []
+    for i, item in enumerate(data.get("documents") or []):
+        if not isinstance(item, dict):
+            continue
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        documents.append({
+            "doc_id": str(item.get("doc_id") or f"doc_{i + 1}"),
+            "title": item.get("title") or f"文档{i + 1}",
+            "text": text,
+            "published_at": item.get("published_at"),
+        })
+
+    corpus_ids = data.get("corpus_ids") or []
+    if corpus_ids:
+        store = _registry().task("corpus")
+        for cid in corpus_ids:
+            record = store.get(cid)
+            if record and not record.get("_deleted"):
+                documents.append({
+                    "doc_id": record.get("id", cid),
+                    "title": record.get("name", cid),
+                    "text": record.get("text", ""),
+                    "published_at": record.get("created_at"),
+                })
+    return documents
+
+
+def _run_multi_synthesis(documents: list[dict], data: dict) -> dict:
+    return get_multi_summarizer().synthesize(
+        documents,
+        ratio=data.get("ratio", 0.35),
+        max_sentences=data.get("max_sentences"),
+        order=data.get("order", "logic"),
+        dedup_threshold=data.get("dedup_threshold", 0.4),
+        max_source_share=data.get("max_source_share", 0.5))
+
+
+@api.post("/multi-summary")
+def multi_summarize():
+    """对一组文档（内联或引用语料库）做事实对齐合成，并持久化为一个版本。"""
+    data = _payload()
+    documents = _resolve_multi_documents(data)
+    if len(documents) < 1:
+        return jsonify({"error": "至少需要一篇文档"}), 400
+    result = _run_multi_synthesis(documents, data)
+    record = {
+        "name": data.get("name") or f"多文档合成_{int(time.time())}",
+        "documents": [{"doc_id": d["doc_id"], "title": d["title"]}
+                      for d in documents],
+        "result": result,
+        "version": 1,
+        "created_at": time.time(),
+    }
+    rid = _registry().task("multi_summary").insert(record)
+    result["id"] = rid
+    result["version"] = 1
+    return jsonify(result)
+
+
+@api.post("/multi-summary/preview")
+def multi_summarize_preview():
+    """仅预览合成结果，不落库（便于反复调参）。"""
+    data = _payload()
+    documents = _resolve_multi_documents(data)
+    if len(documents) < 1:
+        return jsonify({"error": "至少需要一篇文档"}), 400
+    return jsonify(_run_multi_synthesis(documents, data))
+
+
+@api.get("/multi-summary")
+def list_multi_summaries():
+    records = _registry().task("multi_summary").all()
+    items = [{
+        "id": r.get("id"),
+        "name": r.get("name", "未命名"),
+        "version": r.get("version", 1),
+        "parent_id": r.get("parent_id"),
+        "doc_count": len(r.get("documents", [])),
+        "created_at": r.get("created_at"),
+        "preview": (r.get("result", {}) or {}).get("summary", "")[:100],
+    } for r in records if not r.get("_deleted")]
+    items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    return jsonify({"items": items})
+
+
+@api.get("/multi-summary/<mid>")
+def get_multi_summary(mid: str):
+    record = _registry().task("multi_summary").get(mid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "合成记录不存在"}), 404
+    return jsonify(record)
+
+
+@api.delete("/multi-summary/<mid>")
+def delete_multi_summary(mid: str):
+    ok = _registry().task("multi_summary").delete(mid)
+    return jsonify({"ok": ok})
+
+
+@api.post("/multi-summary/<mid>/update")
+def update_multi_summary(mid: str):
+    """文档增减后的增量再合成。
+
+    基于历史版本重新计算（事实簇以内容指纹对齐），输出新增 / 消失 /
+    来源变化，并把新版本持久化、链接到旧版本。仅接受内联 documents，
+    以保证调用方明确当前的文档集合。
+    """
+    store = _registry().task("multi_summary")
+    previous_record = store.get(mid)
+    if not previous_record or previous_record.get("_deleted"):
+        return jsonify({"error": "合成记录不存在"}), 404
+
+    data = _payload()
+    documents = _resolve_multi_documents(data)
+    if len(documents) < 1:
+        return jsonify({"error": "至少需要一篇文档"}), 400
+
+    params = (previous_record.get("result", {}) or {}).get("params", {})
+    # 请求可临时覆盖排序等参数
+    params = {**params, **{k: data[k] for k in
+                           ("order", "ratio", "max_sentences") if k in data}}
+    result = get_multi_summarizer().update(
+        previous_record.get("result", {}), documents)
+
+    version = int(previous_record.get("version", 1)) + 1
+    record = {
+        "name": data.get("name") or previous_record.get("name", "多文档合成"),
+        "documents": [{"doc_id": d["doc_id"], "title": d["title"]}
+                      for d in documents],
+        "result": result,
+        "version": version,
+        "parent_id": mid,
+        "created_at": time.time(),
+    }
+    new_id = store.insert(record)
+    result["id"] = new_id
+    result["version"] = version
+    result["parent_id"] = mid
     return jsonify(result)
 
 

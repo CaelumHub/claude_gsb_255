@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多文档合成 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .ms-summary { font-size: 16px; line-height: 2.1; background: var(--primary-soft);
+                  border: 1px solid #c7d2fe; border-radius: 10px; padding: 18px 20px; white-space: pre-wrap; }
+    .cite { display: inline-block; font-size: 11px; color: #4f46e5; font-family: var(--mono);
+            vertical-align: super; cursor: help; padding: 0 1px; font-weight: 600; }
+    .cite.multi { color: #b45309; }
+    .doc-pick { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+                border: 1px solid var(--border); border-radius: 8px; margin: 4px 0; }
+    .doc-pick input { margin: 0; }
+    .fact { padding: 8px 12px; border-radius: 8px; margin: 6px 0; border: 1px solid var(--border); }
+    .fact.selected { background: var(--primary-soft); border-color: #c7d2fe; }
+    .fact .meta { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .src-tag { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 10px;
+               background: #eef2ff; color: #3730a3; margin: 1px 3px 1px 0; }
+    .conflict-box { border-left: 3px solid #dc2626; background: #fef2f2; padding: 10px 14px;
+                    border-radius: 0 8px 8px 0; margin: 8px 0; }
+    .change-add { color: #15803d; } .change-del { color: #b91c1c; }
+    .change-mod { color: #b45309; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">多文档事实对齐合成</h1>
+    <p class="page-desc">跨多篇报道对齐事实、去除重复、标注来源，输出连贯摘要；增删文档可增量再合成，不丢关键信息。</p>
+
+    <div class="grid cols-2">
+      <!-- 文档选择 -->
+      <section class="card">
+        <div class="toolbar">
+          <h2 style="margin:0;flex:1">① 选择文档</h2>
+          <button class="btn secondary small" id="btn-reload-corpus">刷新语料</button>
+        </div>
+        <div id="corpus-picker" class="mt"><div class="muted small">加载中…</div></div>
+        <div class="mt">
+          <h3>或直接粘贴多篇（每篇用 <code>====</code> 分隔）</h3>
+          <textarea id="inline-docs" style="min-height:110px" placeholder="报道一正文……&#10;====&#10;报道二正文……"></textarea>
+          <label class="small muted">统一标题前缀：</label>
+          <input type="text" id="inline-prefix" value="粘贴文档" style="width:120px">
+        </div>
+      </section>
+
+      <!-- 参数 -->
+      <section class="card">
+        <h2>② 合成参数</h2>
+        <div class="mb">
+          <label>组织方式</label>
+          <select id="order">
+            <option value="logic">逻辑主线（主题连贯，自动分段）</option>
+            <option value="timeline">时间线（按事件日期排序）</option>
+            <option value="source">按来源分组</option>
+          </select>
+        </div>
+        <div class="mb">
+          <label>入选事实比例：<span id="ratio-val">35%</span></label>
+          <input type="range" id="ratio" min="15" max="90" value="35">
+        </div>
+        <div class="mb">
+          <label>句数上限（0 = 按比例）</label>
+          <input type="number" id="max-sentences" value="0" min="0" max="50">
+        </div>
+        <div class="mb">
+          <label>去重相似度阈值：<span id="dedup-val">0.40</span></label>
+          <input type="range" id="dedup" min="30" max="70" value="40">
+        </div>
+        <div class="row">
+          <button class="btn" id="btn-synth">合成摘要</button>
+          <button class="btn secondary" id="btn-save" disabled>保存为合成任务</button>
+        </div>
+        <p class="small muted mt">预览不写库；保存后可在下方对同一文档集合做增删的增量更新。</p>
+      </section>
+    </div>
+
+    <!-- 结果 -->
+    <section class="card" id="result-card" style="display:none">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">③ 合成结果 <span id="result-badges" class="small"></span></h2>
+      </div>
+      <div class="ms-summary mt" id="ms-summary"></div>
+      <div id="ms-sources" class="small muted mt"></div>
+
+      <div class="mt" id="changes-block" style="display:none">
+        <h3>本次更新变化</h3>
+        <div id="changes"></div>
+      </div>
+
+      <div class="mt" id="increment-block" style="display:none">
+        <h3>④ 文档增减后增量更新</h3>
+        <div id="active-docs" class="small"></div>
+        <div class="row mt">
+          <button class="btn secondary" id="btn-rerun">用当前勾选文档重新合成（保留版本）</button>
+          <span id="rerun-status" class="small muted"></span>
+        </div>
+      </div>
+    </section>
+
+    <div class="grid cols-2" id="detail-cards" style="display:none">
+      <section class="card">
+        <h2>事实对齐明细</h2>
+        <div id="facts" class="small"></div>
+      </section>
+      <section class="card">
+        <h2>口径分歧（未强行合并）</h2>
+        <div id="conflicts" class="small"></div>
+      </section>
+    </div>
+
+    <!-- 已保存任务 -->
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">已保存的合成任务</h2>
+        <button class="btn secondary small" id="btn-refresh-saved">刷新</button>
+      </div>
+      <div id="saved-list" class="list mt"><div class="muted small">加载中…</div></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("multi_summary.html");
+
+let corpora = [];
+let currentResult = null;       // 最近一次合成结果
+let currentDocs = [];           // 合成所用文档（含完整 text）
+let savedId = null;             // 已保存记录 id
+
+/* ---------- 语料勾选 ---------- */
+async function loadCorpora() {
+  const box = $("#corpus-picker");
+  try {
+    const data = await api("/api/corpus");
+    corpora = data.corpora;
+    if (!corpora.length) {
+      box.innerHTML = '<div class="muted small">语料库为空，可直接粘贴。</div>';
+      return;
+    }
+    box.innerHTML = corpora.map(c => `
+      <label class="doc-pick">
+        <input type="checkbox" class="pick" value="${esc(c.id)}">
+        <span style="flex:1">${esc(c.name)} <span class="badge blue small">${c.length}字</span></span>
+      </label>`).join("");
+  } catch (e) { box.innerHTML = `<div class="muted small">${esc(e.message)}</div>`; }
+}
+
+function parseInlineDocs() {
+  const raw = $("#inline-docs").value.trim();
+  if (!raw) return [];
+  const prefix = $("#inline-prefix").value.trim() || "粘贴文档";
+  return raw.split(/\n====\n?/).map((t, i) => ({
+    doc_id: `inline_${i + 1}`,
+    title: `${prefix}${i + 1}`,
+    text: t.trim(),
+  })).filter(d => d.text);
+}
+
+async function collectDocuments() {
+  const ids = $$(".pick:checked").map(el => el.value);
+  const docs = parseInlineDocs();
+  if (ids.length) {
+    for (const c of corpora.filter(c => ids.includes(c.id))) {
+      const full = await api(`/api/corpus/${c.id}`);
+      docs.push({ doc_id: full.id, title: full.name, text: full.text,
+                  published_at: full.created_at });
+    }
+  }
+  return docs;
+}
+
+function params() {
+  return {
+    order: $("#order").value,
+    ratio: parseInt($("#ratio").value) / 100,
+    max_sentences: parseInt($("#max-sentences").value) || null,
+    dedup_threshold: parseInt($("#dedup").value) / 100,
+  };
+}
+
+$("#ratio").addEventListener("input", e => $("#ratio-val").textContent = e.target.value + "%");
+$("#dedup").addEventListener("input", e => $("#dedup-val").textContent = (e.target.value / 100).toFixed(2));
+
+/* ---------- 渲染 ---------- */
+function renderSummary(r) {
+  // 把 [1][2] 引用渲染成可悬停的来源标记
+  const sourceMap = {};
+  r.sources.forEach(s => { sourceMap[s.index] = s; });
+  const html = esc(r.summary).replace(/\[(\d+)\]/g, (m, n) => {
+    const s = sourceMap[n];
+    const title = s ? `${s.title}（${s.doc_id}）` : `来源 ${n}`;
+    return `<span class="cite" title="${esc(title)}">[${n}]</span>`;
+  });
+  $("#ms-summary").innerHTML = html;
+
+  const st = r.stats;
+  $("#result-badges").innerHTML =
+    `<span class="badge blue">${st.documents} 篇</span>
+     <span class="badge">${st.sentences} 句</span>
+     <span class="badge">${st.facts} 个事实</span>
+     <span class="badge">选入 ${st.selected}</span>
+     <span class="badge">重复对齐率 ${(st.redundancy_rate * 100).toFixed(0)}%</span>`;
+
+  $("#ms-sources").innerHTML = "<strong>来源：</strong>" + r.sources.map(s =>
+    `[${s.index}] ${esc(s.title)}`).join("　");
+
+  // 事实明细
+  $("#facts").innerHTML = r.clusters.slice().sort((a, b) => b.score - a.score).map(c => `
+    <div class="fact ${c.selected ? "selected" : ""}">
+      ${c.selected ? '<span class="badge blue small">入选</span> ' : ""}${esc(c.rep_text)}
+      <div class="meta">
+        重要度 ${c.score} · ${c.support} 篇印证 ${c.date ? "· 日期 " + esc(c.date) : ""}
+        ${c.concrete ? "· 含具体口径" : ""}
+      </div>
+      <div class="meta">${c.members.map(m =>
+        `<span class="src-tag" title="${esc(m.text)}">${m.is_primary ? "★" : ""}${esc(m.doc_title)}#${m.sent_index + 1}</span>`
+      ).join("")}</div>
+    </div>`).join("");
+
+  // 分歧
+  if (!r.conflicts.length) {
+    $("#conflicts").innerHTML = '<div class="muted">未发现跨文档口径分歧。</div>';
+  } else {
+    $("#conflicts").innerHTML = r.conflicts.map(cf => `
+      <div class="conflict-box">
+        <strong>⚠ ${esc(cf.kind_name)}</strong>
+        （${cf.values_a.map(esc).join("、")} vs ${cf.values_b.map(esc).join("、")}）
+        <div class="mt"><span class="src-tag">[${srcIndex(cf.claim_a.doc_id, r)}]</span>${esc(cf.claim_a.title)}：${esc(cf.claim_a.text)}</div>
+        <div><span class="src-tag">[${srcIndex(cf.claim_b.doc_id, r)}]</span>${esc(cf.claim_b.title)}：${esc(cf.claim_b.text)}</div>
+      </div>`).join("");
+  }
+
+  $("#result-card").style.display = "";
+  $("#detail-cards").style.display = "";
+}
+
+function srcIndex(docId, r) {
+  const s = r.sources.find(x => x.doc_id === docId);
+  return s ? s.index : "?";
+}
+
+function renderChanges(r) {
+  const ch = r.changes;
+  if (!ch) { $("#changes-block").style.display = "none"; return; }
+  $("#changes-block").style.display = "";
+  let html = "";
+  html += ch.added.map(c => `<div class="change-add">＋ 新增事实：${esc(c.text)}（${c.support} 篇印证）</div>`).join("");
+  html += ch.removed.map(c => `<div class="change-del">－ 消失事实：${esc(c.text)}</div>`).join("");
+  html += ch.attribution.map(a =>
+    `<div class="change-mod">≋ 来源变化：${esc(a.text)} ${a.support_before} 篇 → ${a.support_after} 篇` +
+    (a.added_sources.length ? `；新增来源 ${a.added_sources.map(esc).join("、")}` : "") +
+    (a.removed_sources.length ? `；失去来源 ${a.removed_sources.map(esc).join("、")}` : "") +
+    "</div>").join("");
+  if (!html) html = '<div class="muted small">事实集合无变化。</div>';
+  $("#changes").innerHTML = html;
+}
+
+function renderActiveDocs() {
+  $("#active-docs").innerHTML = currentDocs.map((d, i) => `
+    <label class="doc-pick">
+      <input type="checkbox" class="active-pick" data-idx="${i}" checked>
+      <span style="flex:1">${esc(d.title)}</span>
+      <span class="small muted">${esc(d.doc_id)}</span>
+    </label>`).join("");
+  $("#increment-block").style.display = savedId ? "" : "none";
+}
+
+/* ---------- 动作 ---------- */
+async function synth(persist) {
+  currentDocs = await collectDocuments();
+  if (currentDocs.length < 1) return toast("请选择或粘贴至少一篇文档", "err");
+  const btn = persist ? $("#btn-save") : $("#btn-synth");
+  setLoading(btn, true, "合成中…");
+  try {
+    const body = { documents: currentDocs, ...params(),
+                   name: `多文档合成_${new Date().toLocaleString("zh-CN")}` };
+    const r = persist
+      ? await api("/api/multi-summary", { method: "POST", body })
+      : await api("/api/multi-summary/preview", { method: "POST", body });
+    currentResult = r;
+    savedId = persist ? r.id : savedId;
+    $("#btn-save").disabled = false;
+    renderSummary(r);
+    renderChanges(r);
+    renderActiveDocs();
+    if (persist) { loadSaved(); toast("已保存合成任务 v" + r.version); }
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+$("#btn-synth").addEventListener("click", () => synth(false));
+$("#btn-save").addEventListener("click", () => synth(true));
+$("#btn-reload-corpus").addEventListener("click", loadCorpora);
+
+$("#btn-rerun").addEventListener("click", async () => {
+  if (!savedId) return;
+  const kept = $$(".active-pick:checked").map(el => currentDocs[+el.dataset.idx]);
+  if (!kept.length) return toast("至少保留一篇文档", "err");
+  const btn = $("#btn-rerun");
+  setLoading(btn, true, "增量合成中…");
+  try {
+    const r = await api(`/api/multi-summary/${savedId}/update`, {
+      method: "POST",
+      body: { documents: kept, order: params().order, ratio: params().ratio,
+              max_sentences: params().max_sentences },
+    });
+    savedId = r.id;
+    currentDocs = kept;
+    currentResult = r;
+    renderSummary(r);
+    renderChanges(r);
+    renderActiveDocs();
+    loadSaved();
+    $("#rerun-status").textContent = `已生成 v${r.version}`;
+    toast("增量更新完成 v" + r.version);
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+});
+
+/* ---------- 已保存任务 ---------- */
+async function loadSaved() {
+  const box = $("#saved-list");
+  try {
+    const data = await api("/api/multi-summary");
+    if (!data.items.length) {
+      box.innerHTML = '<div class="muted small">暂无保存记录。</div>';
+      return;
+    }
+    box.innerHTML = data.items.map(it => `
+      <div class="list-item">
+        <div class="meta" style="flex:1">
+          <div class="name">${esc(it.name)}
+            <span class="badge blue small">v${it.version}</span>
+            <span class="badge small">${it.doc_count} 篇</span>
+            ${it.parent_id ? '<span class="badge small">增量版本</span>' : ""}
+          </div>
+          <div class="sub">${esc(it.id)} · ${fmtTime(it.created_at)}</div>
+          <div class="preview mt">${esc(it.preview)}</div>
+        </div>
+        <button class="btn secondary small" onclick="openSaved('${esc(it.id)}')">载入</button>
+        <button class="btn danger small" onclick="delSaved('${esc(it.id)}')">删除</button>
+      </div>`).join("");
+  } catch (e) { box.innerHTML = `<div class="muted small">${esc(e.message)}</div>`; }
+}
+
+async function openSaved(id) {
+  try {
+    const rec = await api(`/api/multi-summary/${id}`);
+    savedId = rec.id;
+    currentResult = rec.result;
+    // 载入文档元信息；正文通过 corpus 引用时无法还原，增量时需重新选择
+    currentDocs = rec.documents.map((d, i) => ({ doc_id: d.doc_id, title: d.title, text: "" }));
+    renderSummary(rec.result);
+    renderChanges(rec.result);
+    renderActiveDocs();
+    toast(`已载入 v${rec.version}（如需增量更新，请重新勾选含正文的语料）`);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function delSaved(id) {
+  if (!confirm("确认删除该合成记录（历史版本不受影响）？")) return;
+  try {
+    await api(`/api/multi-summary/${id}`, { method: "DELETE" });
+    if (savedId === id) { savedId = null; }
+    loadSaved();
+    toast("已删除");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+$("#btn-refresh-saved").addEventListener("click", loadSaved);
+
+loadCorpora();
+loadSaved();
+</script>
+</body>
+</html>
