@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多文档融合 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .doc-pick { display: flex; flex-wrap: wrap; gap: 8px; }
+    .doc-pick label { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px;
+      border: 1px solid var(--border); border-radius: 8px; cursor: pointer; margin: 0; }
+    .doc-pick label.sel { background: var(--primary-soft); border-color: #c7d2fe; }
+    .summary-box { font-size: 16px; line-height: 2.1; background: var(--primary-soft);
+      border: 1px solid #c7d2fe; border-radius: 10px; padding: 18px 20px; }
+    .summary-box .fs { border-bottom: 3px solid; border-radius: 2px; cursor: pointer; padding: 1px 0; }
+    .summary-box .fs:hover { background: #fff; }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+    .legend .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted); }
+    .legend .dot { width: 12px; height: 12px; border-radius: 4px; display: inline-block; }
+    .src-row { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; margin: 8px 0; }
+    .src-row .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .src-row .text { margin-top: 6px; line-height: 1.8; }
+    .src-row .original { margin-top: 4px; font-size: 12px; color: var(--text-muted); }
+    .src-badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; color: #fff; }
+    .stat-line { font-size: 13px; color: var(--text-muted); margin-top: 10px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">多文档融合摘要</h1>
+    <p class="page-desc">把多篇相关报道合成一篇连贯摘要：跨文档去重、保留各自独有信息、按时间线组织，每句均可溯源。</p>
+
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">选择文档（≥ 1 篇）</h2>
+        <button class="btn secondary small" id="btn-all">全选</button>
+        <button class="btn secondary small" id="btn-none">全不选</button>
+      </div>
+      <div class="doc-pick mt" id="doc-pick"><div class="muted">加载中…</div></div>
+      <div class="row mt">
+        <div style="flex:1">
+          <label>摘要句数：<span id="maxs-val">自动</span></label>
+          <input type="range" id="maxs" min="0" max="12" value="0">
+        </div>
+        <div style="flex:1">
+          <label>判重阈值：<span id="dedup-val">0.55</span></label>
+          <input type="range" id="dedup" min="30" max="90" value="55">
+        </div>
+        <button class="btn" id="btn-fuse">融合摘要</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>合成结果</h2>
+      <div class="summary-box" id="summary">尚未生成。</div>
+      <div class="legend" id="legend"></div>
+      <div class="stat-line" id="stats"></div>
+    </section>
+
+    <section class="card">
+      <h2>逐句溯源</h2>
+      <div id="sources" class="muted">尚未生成。</div>
+    </section>
+
+    <section class="card">
+      <h2>历史记录</h2>
+      <div id="history" class="muted">暂无。</div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("fusion.html");
+
+const PALETTE = ["#4f46e5", "#0891b2", "#059669", "#d97706", "#dc2626",
+                 "#7c3aed", "#db2777", "#65a30d", "#0284c7", "#9333ea"];
+let corpora = [];
+let lastResult = null;
+
+const docColor = (id) => PALETTE[Math.max(0, corpora.findIndex(c => c.id === id)) % PALETTE.length];
+
+async function loadCorpora() {
+  try {
+    const data = await api("/api/corpus");
+    corpora = data.corpora;
+    const host = $("#doc-pick");
+    if (!corpora.length) {
+      host.innerHTML = '<div class="muted">暂无语料，请先到「语料库管理」上传。</div>';
+      return;
+    }
+    host.innerHTML = corpora.map(c => `
+      <label class="sel" data-id="${esc(c.id)}">
+        <input type="checkbox" value="${esc(c.id)}" checked> ${esc(c.name)}
+      </label>`).join("");
+    host.querySelectorAll("input").forEach(cb => cb.addEventListener("change", () => {
+      cb.closest("label").classList.toggle("sel", cb.checked);
+    }));
+  } catch (e) { toast(e.message, "err"); }
+}
+
+$("#btn-all").addEventListener("click", () => setAll(true));
+$("#btn-none").addEventListener("click", () => setAll(false));
+function setAll(v) {
+  $("#doc-pick").querySelectorAll("input").forEach(cb => {
+    cb.checked = v; cb.closest("label").classList.toggle("sel", v);
+  });
+}
+
+$("#maxs").addEventListener("input", e => {
+  const v = parseInt(e.target.value);
+  $("#maxs-val").textContent = v === 0 ? "自动" : v + " 句";
+});
+$("#dedup").addEventListener("input", e => {
+  $("#dedup-val").textContent = (parseInt(e.target.value) / 100).toFixed(2);
+});
+
+async function fuse() {
+  const ids = [...$("#doc-pick").querySelectorAll("input:checked")].map(cb => cb.value);
+  if (!ids.length) return toast("请至少选择一篇文档", "err");
+  const btn = $("#btn-fuse");
+  setLoading(btn, true, "融合中…");
+  try {
+    const body = { corpus_ids: ids, dedup_threshold: parseInt($("#dedup").value) / 100 };
+    const maxs = parseInt($("#maxs").value);
+    if (maxs > 0) body.max_sentences = maxs;
+    const r = await api("/api/fusion", { method: "POST", body });
+    lastResult = r;
+    renderResult(r);
+    loadHistory();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function renderResult(r) {
+  // 摘要：每句按下划线颜色标注其代表来源文档
+  $("#summary").innerHTML = r.sentences.map(s =>
+    `<span class="fs" style="border-color:${docColor(s.doc_id)}" data-idx="${s.index}"
+      title="来源：${esc(s.doc_name)} 第 ${s.sent_index + 1} 句">${esc(s.text)}。</span>`).join("") || "（空）";
+
+  // 图例 + 统计
+  $("#legend").innerHTML = r.docs.map(d =>
+    `<span class="chip"><span class="dot" style="background:${docColor(d.id)}"></span>${esc(d.name)}</span>`).join("");
+  const st = r.stats;
+  $("#stats").textContent =
+    `输入 ${r.doc_count} 篇 / ${st.input_sentences} 句 → 对齐为 ${st.clusters} 个事实簇` +
+    `（消除重复 ${st.duplicates_removed} 句）→ 选取 ${st.selected} 句` +
+    (st.uncovered_docs.length ? `；未覆盖文档：${st.uncovered_docs.join("、")}` : "；全部文档均已覆盖");
+
+  // 逐句溯源
+  $("#sources").innerHTML = r.sentences.map(s => {
+    const srcBadges = s.sources.map(src =>
+      `<span class="src-badge" style="background:${docColor(src.doc_id)}">` +
+      `${esc(src.doc_name)} · 第 ${src.sent_index + 1} 句 · 相似度 ${src.similarity}</span>`).join(" ");
+    return `<div class="src-row" id="src-${s.index}">
+      <div class="head">
+        <span class="badge blue">#${s.index + 1}</span>
+        ${s.time ? `<span class="badge">${esc(s.time)}</span>` : ""}
+        ${s.compressed ? '<span class="badge">已轻压缩</span>' : ""}
+        ${s.sources.length > 1 ? `<span class="badge">${s.sources.length} 篇重复报道</span>` : ""}
+        ${srcBadges}
+      </div>
+      <div class="text">${esc(s.text)}。</div>
+      ${s.compressed ? `<div class="original">原文：${esc(s.original)}</div>` : ""}
+    </div>`;
+  }).join("");
+
+  // 点击摘要句 → 定位溯源行
+  $("#summary").querySelectorAll(".fs").forEach(el => el.addEventListener("click", () => {
+    const row = $("#src-" + el.dataset.idx);
+    if (row) row.scrollIntoView({ behavior: "smooth", block: "center" });
+  }));
+}
+
+async function loadHistory() {
+  try {
+    const data = await api("/api/fusion");
+    const host = $("#history");
+    if (!data.fusions.length) { host.innerHTML = "暂无。"; return; }
+    host.innerHTML = data.fusions.slice(0, 8).map(f => `
+      <div class="list-item">
+        <div class="meta">
+          <div class="name">${esc((f.doc_names || []).join("、") || "未命名")}</div>
+          <div class="sub">${fmtTime(f.created_at)} · ${f.doc_count} 篇 → ${f.sentences} 句</div>
+          <div class="preview">${esc(f.preview)}</div>
+        </div>
+      </div>`).join("");
+  } catch (e) { /* 历史加载失败不阻塞 */ }
+}
+
+$("#btn-fuse").addEventListener("click", fuse);
+loadCorpora();
+loadHistory();
+</script>
+</body>
+</html>

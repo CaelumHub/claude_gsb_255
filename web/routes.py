@@ -14,10 +14,11 @@ from typing import Optional
 
 from flask import Blueprint, current_app, jsonify, request
 
-from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
-                 get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+from nlp import (get_constituency_parser, get_embeddings, get_fuser,
+                 get_keywords, get_ner, get_parser, get_segmenter,
+                 get_sentiment, get_summarizer, get_tagger, get_translator,
+                 ENTITY_TYPE_NAMES, TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES,
+                 POLARITY_NAMES)
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
 
@@ -322,6 +323,84 @@ def summary():
     rid = _store_result("summary", text, result, corpus_id=cid)
     result["id"] = rid
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# 多文档融合摘要
+# ---------------------------------------------------------------------------
+
+def _fusion_docs(data: dict) -> list[dict]:
+    """解析融合请求的文档集合：corpus_ids > texts > 全部语料。"""
+    store = _registry().task("corpus")
+    docs = []
+    if data.get("corpus_ids"):
+        for cid in data["corpus_ids"]:
+            record = store.get(cid)
+            if record and not record.get("_deleted"):
+                docs.append({"id": cid, "name": record.get("name", cid),
+                             "text": record.get("text", ""),
+                             "created_at": record.get("created_at")})
+    elif data.get("texts"):
+        for i, text in enumerate(data["texts"]):
+            docs.append({"id": f"adhoc_{i + 1}", "name": f"文档{i + 1}",
+                         "text": text or ""})
+    else:
+        for record in store.all():
+            if not record.get("_deleted"):
+                docs.append({"id": record.get("id"),
+                             "name": record.get("name", record.get("id")),
+                             "text": record.get("text", ""),
+                             "created_at": record.get("created_at")})
+    return [d for d in docs if (d.get("text") or "").strip()]
+
+
+@api.post("/fusion")
+def fusion():
+    data = _payload()
+    docs = _fusion_docs(data)
+    if not docs:
+        return jsonify({"error": "没有可用文档，请先上传语料或传入 texts"}), 400
+    params = {
+        "max_sentences": data.get("max_sentences"),
+        "ratio": data.get("ratio", 0.5),
+        "dedup_threshold": data.get("dedup_threshold", 0.55),
+        "ensure_coverage": data.get("ensure_coverage", True),
+    }
+    result = get_fuser().fuse(docs, **params)
+    record = {
+        "type": "fusion",
+        "doc_ids": [d["id"] for d in docs],
+        "doc_names": [d["name"] for d in docs],
+        "params": params,
+        "result": result,
+        "created_at": time.time(),
+    }
+    rid = _registry().task("fusion").insert(record)
+    result["id"] = rid
+    return jsonify(result)
+
+
+@api.get("/fusion")
+def fusion_history():
+    records = _registry().task("fusion").all()
+    items = [{
+        "id": r.get("id"),
+        "created_at": r.get("created_at"),
+        "doc_names": r.get("doc_names", []),
+        "doc_count": len(r.get("doc_ids", [])),
+        "sentences": len((r.get("result") or {}).get("sentences", [])),
+        "preview": (r.get("result") or {}).get("summary", "")[:80],
+    } for r in records if not r.get("_deleted")]
+    items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    return jsonify({"fusions": items})
+
+
+@api.get("/fusion/<fid>")
+def fusion_detail(fid: str):
+    record = _registry().task("fusion").get(fid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "融合记录不存在"}), 404
+    return jsonify(record)
 
 
 # ---------------------------------------------------------------------------
